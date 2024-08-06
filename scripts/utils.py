@@ -139,9 +139,29 @@ def rotate_normalmap_by_angle_torch(normal_map, angle):
                       [-torch.sin(angle), 0, torch.cos(angle)]]).to(normal_map)
     return torch.matmul(normal_map.view(-1, 3), R.T).view(normal_map.shape)
 
+def rotate_normalmap_by_rotation_matrix_torch(normal_map, rotation_matrix):
+    if rotation_matrix.shape == (4, 4):
+        rotation_matrix = rotation_matrix[:3, :3]
+    else:
+        rotation_matrix = rotation_matrix
+    assert rotation_matrix.shape == (3, 3), "Rotation matrix must be of shape (3, 3)"
+    reshaped_normal_map = normal_map.view(-1, 3)
+    rotated_normal_map = torch.matmul(reshaped_normal_map, rotation_matrix.T)
+    rotated_normal_map = rotated_normal_map.view(normal_map.shape)
+    return rotated_normal_map
+
 def do_rotate(rgba_normal, angle):
     rgba_normal = torch.from_numpy(rgba_normal).float().cuda() / 255
     rotated_normal_tensor = rotate_normalmap_by_angle_torch(rgba_normal[..., :3] * 2 - 1, angle)
+    rotated_normal_tensor = (rotated_normal_tensor + 1) / 2
+    rotated_normal_tensor = rotated_normal_tensor * rgba_normal[:, :, [3]]    # make bg black
+    rgba_normal_np = torch.cat([rotated_normal_tensor * 255, rgba_normal[:, :, [3]] * 255], dim=-1).cpu().numpy()
+    return rgba_normal_np
+
+def do_transform(rgba_normal, rotation_matrix):
+    rgba_normal = torch.from_numpy(rgba_normal).float().cuda() / 255
+
+    rotated_normal_tensor = rotate_normalmap_by_rotation_matrix_torch(rgba_normal[..., :3] * 2 - 1, rotation_matrix)
     rotated_normal_tensor = (rotated_normal_tensor + 1) / 2
     rotated_normal_tensor = rotated_normal_tensor * rgba_normal[:, :, [3]]    # make bg black
     rgba_normal_np = torch.cat([rotated_normal_tensor * 255, rgba_normal[:, :, [3]] * 255], dim=-1).cpu().numpy()
@@ -161,6 +181,30 @@ def rotate_normals_torch(normal_pils, return_types='np', rotate_direction=1):
         else:
             raise ValueError(f"return_types should be 'np' or 'pil', but got {return_types}")
     return ret
+
+def transform_normals_torch(normal_pils, sparse_cameras, return_types='np', rotate_direction=1):
+    n_views = len(normal_pils)
+    ret = []
+    front_camera, other_cameras = sparse_cameras[0], sparse_cameras[1:]
+    front_model_to_view = front_camera.get_world_to_view_transform(R=front_camera.R, T=front_camera.T).get_matrix().float()
+    front_model_to_view = front_model_to_view.T.reshape(-1,4,4)
+    for rgba_normal, current_camera in zip(normal_pils, other_cameras):
+        # transform normal
+        current_model_to_view = current_camera.get_world_to_view_transform(R=current_camera.R, T=current_camera.T).get_matrix().float()
+        current_model_to_view = current_model_to_view.T.reshape(-1,4,4)
+        current_model_to_view = current_model_to_view.to(device=front_model_to_view.device)
+        transform_matrix = torch.matmul(current_model_to_view, front_model_to_view.inverse())
+        rotation_matrix = transform_matrix[:,:3,:3].squeeze(0)
+        rgba_normal_np = do_transform(np.array(rgba_normal), rotation_matrix)
+        if return_types == 'np':
+            ret.append(rgba_normal_np)
+        elif return_types == 'pil':
+            ret.append(Image.fromarray(rgba_normal_np.astype(np.uint8)))
+        else:
+            raise ValueError(f"return_types should be 'np' or 'pil', but got {return_types}")
+    return ret
+
+
 
 def change_bkgd(img_pils, new_bkgd=(0., 0., 0.)):
     ret = []

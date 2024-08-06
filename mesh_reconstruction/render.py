@@ -14,6 +14,9 @@ def _warmup(glctx, device=None):
 
 glctx = dr.RasterizeGLContext(output_db=False, device="cuda")
 
+
+
+
 class NormalsRenderer:
     
     _glctx:dr.RasterizeGLContext = None
@@ -23,13 +26,55 @@ class NormalsRenderer:
             mv: torch.Tensor, #C,4,4
             proj: torch.Tensor, #C,4,4
             image_size: Tuple[int,int],
+            sparse_cameras = None,
             mvp = None,
             device=None,
             ):
         if mvp is None:
-            self._mvp = proj @ mv #C,4,4
+            if mv is not None and proj is not None:
+                self._mvp = proj @ mv #C,4,4
+            else:
+                self._mvp = None
         else:
             self._mvp = mvp
+        self.sparse_RT = None
+        self.sparse_intrinsics = None
+        if sparse_cameras is not None:
+            sparse_mvp = []
+            sparse_RT = []
+            sparse_intrinsics = []
+            
+            from mesh_reconstruction.func import _orthographic, _projection, getProjectionMatrix
+            for camera in sparse_cameras:
+                # world_to_view_transform = camera.get_world_to_view_transform(R=camera.R, T=camera.T).get_matrix()
+                # world_to_view_transform = world_to_view_transform.T.reshape(-1,4,4)
+                # model_view_projection_matrix = proj1 @ world_to_view_transform
+                # print("render_view", world_to_view_transform)
+                world_to_view_transform = camera.get_world_to_view_transform(R=camera.R, T=camera.T).get_matrix().float()
+                # world_to_view_transform = world_to_view_transform.T.reshape(-1,4,4)
+                print("world_to_view_transform1111", world_to_view_transform.shape, world_to_view_transform)
+                proj1 = camera.get_projection_transform().get_matrix().float()
+                intrinsic_matrix = proj1
+                model_view_projection_matrix1 = proj1 @ world_to_view_transform
+
+                model_view_projection_matrix = camera.get_full_projection_transform().get_matrix().float()
+                
+                # print("model_view_projection_matrix111",model_view_projection_matrix)
+                # print("model_view_projection_matrix",model_view_projection_matrix1)
+                # print("model_view_projection_matrix2222",model_view_projection_matrix1)
+                sparse_mvp.append(model_view_projection_matrix.float())
+                sparse_RT.append(world_to_view_transform)
+                sparse_intrinsics.append(intrinsic_matrix)
+            sparse_mvp = torch.stack(sparse_mvp, dim=0).squeeze(1) #C,4,4
+            self.sparse_RT = torch.stack(sparse_RT, dim=0).squeeze(1) #C,4,4
+            self.sparse_intrinsics = torch.stack(sparse_intrinsics, dim=0).squeeze(1) #C,4,4
+            # sparse_cameras = torch.stack(sparse_cameras, dim=0) 
+            if self._mvp is not None:
+                self._mvp = torch.cat((self._mvp, sparse_mvp), dim=0)
+            else:
+                self._mvp = sparse_mvp
+            # plot_pose(self._mvp, './', 'pose')
+            
         self._image_size = image_size
         self._glctx = glctx
         _warmup(self._glctx, device)
@@ -41,10 +86,19 @@ class NormalsRenderer:
             ) ->torch.Tensor: #C,H,W,4
 
         V = vertices.shape[0]
-        faces = faces.type(torch.int32)
+        faces = faces.type(torch.int32) 
         vert_hom = torch.cat((vertices, torch.ones(V,1,device=vertices.device)),axis=-1) #V,3 -> V,4
-        vertices_clip = vert_hom @ self._mvp.transpose(-2,-1) #C,V,4
+        # vertices_clip = vert_hom @ self._mvp #C,V,4
+        vertices_clip = vert_hom @ self._mvp #.transpose(-2,-1) #C,V,4
+        # vertices_clip = vertices_clip[:3] / vertices_clip[-1] 
+        # vertices_clip = torch.cat((vertices_clip, torch.ones(vertices_clip.shape[0],vertices_clip.shape[1],1,device=vertices.device)),axis=-1) #V,3 -> V,4
+        # print("vertices_clip",vertices_clip.shape)#C,V,4 torch.Size([6, 1827, 4])apt 
         rast_out,_ = dr.rasterize(self._glctx, vertices_clip, faces, resolution=self._image_size, grad_db=False) #C,H,W,4
+        import imageio
+        rast_out_image = (rast_out * 255).to(torch.uint8).cpu()
+        image_data = rast_out_image[0]
+        imageio.imwrite('render_rast.png', image_data)
+
         vert_col = (normals+1)/2 #V,3
         col,_ = dr.interpolate(vert_col, rast_out, faces) #C,H,W,3
         alpha = torch.clamp(rast_out[..., -1:], max=1) #C,H,W,1

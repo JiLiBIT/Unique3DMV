@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import trimesh
 from typing import Tuple
-
+import math
 def to_numpy(*args):
     def convert(a):
         if isinstance(a,torch.Tensor):
@@ -59,6 +59,28 @@ def _projection(r, device, l=None, t=None, b=None, n=1.0, f=50.0, flip_y=True):
     p[2,3] = -(2*f*n)/(f-n)
     p[3,2] = -1
     return p #4,4
+
+def getProjectionMatrix(znear=0.01, zfar=100.0, fovX=60.0, fovY=60.0, flip_y=True,device='cuda'):
+    tanHalfFovY = math.tan((fovY / 2))
+    tanHalfFovX = math.tan((fovX / 2))
+
+    top = tanHalfFovY * znear
+    bottom = -top
+    right = tanHalfFovX * znear
+    left = -right
+
+    P = torch.zeros([4, 4],device=device)
+
+    z_sign = -1.0
+
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom) * (-1 if flip_y else 1)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
 
 def _orthographic(r, device, l=None, t=None, b=None, n=1.0, f=50.0, flip_y=True):
     if l is None:

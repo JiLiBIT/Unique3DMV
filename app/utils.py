@@ -33,8 +33,8 @@ def simple_remove(imgs, run_sr=True):
         single_input = True
     else:
         single_input = False
-    if run_sr:
-        imgs = run_sr_fast(imgs)
+    # if run_sr:
+    #     imgs = run_sr_fast(imgs) #TODO
     rets = []
     for img in imgs:
         arr = np.array(img)
@@ -110,3 +110,71 @@ def make_image_grid(images, rows=None, cols=None, resize=None):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
 
+def extract_obj_and_resize_images(pil_list, target_size):
+    resized_images = []
+    box_sizes = []
+    wheres = []
+    for img in pil_list:
+        np_img = np.array(img)[...,-1][...,None]
+        non_black_pixels = np.where(np_img != 0)
+        y_min, y_max = np.min(non_black_pixels[0]), np.max(non_black_pixels[0])
+        x_min, x_max = np.min(non_black_pixels[1]), np.max(non_black_pixels[1])
+
+        # is_nonzero_rgb = np.any(np_img[:, :, :3] != 0, axis=-1)
+        # rows = np.any(is_nonzero_rgb, axis=1)
+        # cols = np.any(is_nonzero_rgb, axis=0)
+        # y_min, y_max = np.where(rows)[0][[0, -1]]
+        # x_min, x_max = np.where(cols)[0][[0, -1]]
+
+        cropped_img = img.crop((x_min, y_min, x_max, y_max))
+        box_width = x_max - x_min
+        box_height = y_max - y_min
+        box_sizes.append((box_width, box_height))
+        wheres.append((x_min, x_max, y_min, y_max))
+        resized_img = cropped_img.resize(target_size, Image.LANCZOS)
+        resized_images.append(resized_img)
+    
+    return resized_images, box_sizes, wheres
+
+def extract_obj(pil_list):
+    resized_images = []
+    box_sizes = []
+    wheres = []
+    for img in pil_list:
+        np_img = np.array(img)[...,-1][...,None]
+        non_black_pixels = np.where(np_img != 0)
+        y_min, y_max = np.min(non_black_pixels[0]), np.max(non_black_pixels[0])
+        x_min, x_max = np.min(non_black_pixels[1]), np.max(non_black_pixels[1])
+
+        # is_nonzero_rgb = np.any(np_img[:, :, :3] != 0, axis=-1)
+        # rows = np.any(is_nonzero_rgb, axis=1)
+        # cols = np.any(is_nonzero_rgb, axis=0)
+        # y_min, y_max = np.where(rows)[0][[0, -1]]
+        # x_min, x_max = np.where(cols)[0][[0, -1]]
+
+        cropped_img = img.crop((x_min, y_min, x_max, y_max))
+        box_width = x_max - x_min
+        box_height = y_max - y_min
+        box_sizes.append((box_width, box_height))
+        wheres.append((x_min, x_max, y_min, y_max))
+        # resized_img = cropped_img.resize(target_size, Image.LANCZOS)
+        # resized_images.append(resized_img)
+    
+    return box_sizes, wheres
+
+
+def resize_and_place_images(original_images, target_size, box_sizes, min_max_coords_list):
+    new_images = []
+    for original_image, box_size, min_max_coords in zip(original_images, box_sizes, min_max_coords_list):
+        new_image = Image.new("RGBA", target_size, (0, 0, 0, 0))
+        original_image = original_image.convert("RGBA")
+        resized_image = original_image.resize(box_size, Image.LANCZOS)
+        x_min, x_max, y_min, y_max = min_max_coords
+        box_width, box_height = box_size
+        x_offset = target_size[0] - x_min - box_width
+        # y_offset = target_size[1] - y_min - box_height
+        y_offset = y_min
+
+        new_image.paste(resized_image, (x_offset, y_offset), resized_image)
+        new_images.append(new_image)
+    return new_images

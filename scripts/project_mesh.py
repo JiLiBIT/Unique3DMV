@@ -2,7 +2,7 @@ from typing import List
 import torch
 import numpy as np
 from PIL import Image
-from pytorch3d.renderer.cameras import look_at_view_transform, OrthographicCameras, CamerasBase
+from pytorch3d.renderer.cameras import look_at_view_transform, OrthographicCameras, PerspectiveCameras, CamerasBase
 from pytorch3d.renderer.mesh.rasterizer import Fragments
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -12,13 +12,25 @@ from pytorch3d.renderer import (
     FoVOrthographicCameras,
 )
 from pytorch3d.renderer import MeshRasterizer
+import nvdiffrast.torch as dr
+import os 
+import sys
+current_folder = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(f'{current_folder}')
+from colmap_utils import read_cameras_binary, read_images_binary
+import math
 
-def get_camera(world_to_cam, fov_in_degrees=60, focal_length=1 / (2**0.5), cam_type='fov'):
+def get_camera(world_to_cam, fov_in_degrees=60, focal_length=1 / (2**0.5), cam_type='fov', K=None):
     # pytorch3d expects transforms as row-vectors, so flip rotation: https://github.com/facebookresearch/pytorch3d/issues/1183
-    R = world_to_cam[:3, :3].t()[None, ...]
+    R = world_to_cam[:3, :3].t()[None, ...] #
     T = world_to_cam[:3, 3][None, ...]
     if cam_type == 'fov':
-        camera = FoVPerspectiveCameras(device=world_to_cam.device, R=R, T=T, fov=fov_in_degrees, degrees=True)
+        if K is not None:
+            camera = FoVPerspectiveCameras(device=world_to_cam.device, R=R, T=T, K=K, degrees=True)
+        else:
+            camera = FoVPerspectiveCameras(device=world_to_cam.device, R=R, T=T,
+                                                fov=65, degrees=True,
+                                                znear=0.1, zfar=50.0, aspect_ratio=1.0)
     else:
         focal_length = 1 / focal_length
         camera = FoVOrthographicCameras(device=world_to_cam.device, R=R, T=T, min_x=-focal_length, max_x=focal_length, min_y=-focal_length, max_y=focal_length)
@@ -54,7 +66,6 @@ def render_pix2faces_py3d(meshes, cameras, H=512, W=512, blur_radius=0.0, faces_
         "pix_to_face": fragments.pix_to_face[..., 0],
     }
 
-import nvdiffrast.torch as dr
 
 def _warmup(glctx, device=None):
     device = 'cuda' if device is None else device
@@ -73,17 +84,27 @@ class Pix2FacesRenderer:
 
     def transform_vertices(self, meshes: Meshes, cameras: CamerasBase):
         vertices = cameras.transform_points_ndc(meshes.verts_padded())
-
+        print("vertices:",vertices.shape)
         perspective_correct = cameras.is_perspective()
         znear = cameras.get_znear()
         if isinstance(znear, torch.Tensor):
             znear = znear.min().item()
         z_clip = None if not perspective_correct or znear is None else znear / 2
+       
+        
+        if not cameras.is_perspective():
+            vertices = vertices * torch.tensor([1, 1, 1]).to(vertices) # -1, -1, 1
+            vertices = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1).to(torch.float32)
+        else:
+            vertices = vertices * torch.tensor([1, 1, 1]).to(vertices)
+            vertices = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1).to(torch.float32)
+        # if z_clip: #TODO
+        #     vertices = vertices[vertices[..., 2] >= cameras.get_znear()][None]    # clip
 
-        if z_clip:
-            vertices = vertices[vertices[..., 2] >= cameras.get_znear()][None]    # clip
-        vertices = vertices * torch.tensor([-1, -1, 1]).to(vertices)
-        vertices = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1).to(torch.float32)
+        print(cameras.is_perspective(),vertices,vertices[..., 2].mean())
+        # False tensor([[[-0.1265,  0.3504,  0.0396,  0.9604],
+        # True tensor([[[-0.6371,  0.1615,  3.5801,  4.4011],
+
         return vertices
 
     def render_pix2faces_nvdiff(self, meshes: Meshes, cameras: CamerasBase, H=512, W=512):
@@ -91,8 +112,21 @@ class Pix2FacesRenderer:
         cameras = cameras.to(self.device)
         vertices = self.transform_vertices(meshes, cameras)
         faces = meshes.faces_packed().to(torch.int32)
+        from pytorch3d.io import save_obj
+        print("vertices: ", vertices.shape, faces.shape)
+        save_obj("project_mesh.obj", vertices.squeeze(0)[...,:3], faces)
+        
         rast_out,_ = dr.rasterize(self._glctx, vertices, faces, resolution=(H, W), grad_db=False) #C,H,W,4
         pix_to_face = rast_out[..., -1].to(torch.int32) - 1
+        # print("rast_out:",rast_out[..., -1])
+        import imageio
+        rast_out_image = (rast_out * 255).to(torch.uint8).cpu()
+        image_data = rast_out_image[0]
+        imageio.imwrite('rast_out.png', image_data)
+        pix_to_face_image = ((pix_to_face+1)/2 * 255).to(torch.uint8).cpu()
+        image_data = pix_to_face_image[0]
+        imageio.imwrite('pix_to_face_out.png', image_data)
+
         return pix_to_face
 
 pix2faces_renderer = Pix2FacesRenderer()
@@ -128,14 +162,36 @@ def project_color(meshes: Meshes, cameras: CamerasBase, pil_image: Image.Image, 
     meshes = meshes.to(device)
     cameras = cameras.to(device)
     image = torch.from_numpy(np.array(pil_image.convert("RGBA")) / 255.).permute((2, 0, 1)).float().to(device)     # in CHW format of [0, 1.]
-    unique_faces = get_visible_faces(meshes, cameras, resolution=resolution)
+    unique_faces = get_visible_faces(meshes, cameras, resolution=resolution) #TODO: resolution=resolution
 
+    
     # visible faces
     faces_normals = meshes.faces_normals_packed()[unique_faces]
     faces_normals = faces_normals / faces_normals.norm(dim=1, keepdim=True)
     world_points = cameras.unproject_points(torch.tensor([[[0., 0., 0.1], [0., 0., 0.2]]]).to(device))[0]
     view_direction = world_points[1] - world_points[0]
+    # view_direction = view_direction + translation_vector
     view_direction = view_direction / view_direction.norm(dim=0, keepdim=True)
+
+
+    verts = meshes.verts_packed()
+    faces = meshes.faces_packed()
+
+    face_centers = verts[faces].mean(dim=1)
+
+
+    def save_vectors_as_obj(vectors, filename, start_points=[[0,0,0]], scale=0.1):
+        with open(filename, 'w') as file:
+            point_index = 1
+            for start_point, vec in zip(start_points, vectors):
+                file.write(f"v {start_point[0]} {start_point[1]} {start_point[2]}\n")
+                end_point = [start_point[j] + scale * vec[j].item() for j in range(3)]
+                file.write(f"v {end_point[0]} {end_point[1]} {end_point[2]}\n")
+                file.write(f"l {point_index} {point_index + 1}\n")
+                point_index += 2
+    # save_vectors_as_obj(torch.stack([view_direction]), 'view_direction2.obj',scale=1.0)
+    # save_vectors_as_obj(faces_normals, 'faces_normals.obj', face_centers)
+
 
     # find invalid faces
     cos_angles = (faces_normals * view_direction).sum(dim=1)
@@ -148,11 +204,17 @@ def project_color(meshes: Meshes, cameras: CamerasBase, pil_image: Image.Image, 
     verts_coordinates = meshes.verts_packed()[verts]   # [N, 3]
 
     # compute color
-    pt_tensor = cameras.transform_points(verts_coordinates)[..., :2] # NDC space points
+    if not cameras.is_perspective():
+        pt_tensor = cameras.transform_points_ndc(verts_coordinates)[..., :2].squeeze(0) # NDC space points
+    else:
+        pt_tensor = cameras.transform_points_ndc(verts_coordinates)[..., :2].squeeze(0) # NDC space points
+    # valid = ~((pt_tensor.isnan()).any(dim=1))  # checked, correct
     valid = ~((pt_tensor.isnan()|(pt_tensor<-1)|(1<pt_tensor)).any(dim=1))  # checked, correct
+    # print("valid",valid.shape)
     valid_pt = pt_tensor[valid, :]
     valid_idx = verts[valid]
-    valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="reflection", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
+    valid_color = torch.nn.functional.grid_sample(image[None], valid_pt[None, :, None, :], align_corners=False, padding_mode="reflection", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
+    # valid_color = torch.nn.functional.grid_sample(image[None].flip((-1, -2)), valid_pt[None, :, None, :], align_corners=False, padding_mode="reflection", mode="bilinear")[0, :, :, 0].T.clamp(0, 1)   # [N, 4], note that bicubic may give invalid value
     alpha, valid_color = valid_color[:, 3:], valid_color[:, :3]
     if not use_alpha:
         alpha = torch.ones_like(alpha)
@@ -309,6 +371,311 @@ def multiview_color_projection(meshes: Meshes, image_list: List[Image.Image], ca
     ret_mesh = meshes.detach()
     del meshes
     return ret_mesh
+
+def fov2focal(fov, pixels):
+    return pixels / (2 * math.tan(fov / 2))
+
+def focal2fov(focal, pixels):
+    return 2*math.atan(pixels/(2*focal))
+
+def get_sparse_cameras_list(front_view_path, sparse_path, colmap_path, raw_size, input_size, device):
+    # get input fxfycxcy
+    import os 
+    import sys
+    front_view_filename = os.path.basename(front_view_path)
+    front_view_filename, _ = os.path.splitext(front_view_filename)
+    camdata = read_cameras_binary(os.path.join(colmap_path, 'sparse/0/cameras.bin')) 
+    imdata = read_images_binary(os.path.join(colmap_path, 'sparse/0/images.bin'))
+    H = W = raw_size
+    img_wh = (input_size, input_size)
+    factor_x = factor_y = 1
+    input_size = 2048
+    # factor_x = input_size / W
+    # factor_y = input_size / H
+    print("[INFO] factor",factor_x, input_size, W)
+    if camdata[1].model == 'SIMPLE_RADIAL':
+        fx = camdata[1].params[0] * factor_x
+        fy = camdata[1].params[0] * factor_y / 1000
+        cx = camdata[1].params[1] * factor_x / 1000
+        cy = camdata[1].params[2] * factor_y / 1000
+    elif camdata[1].model in ['PINHOLE', 'OPENCV']:
+        fx = camdata[1].params[0] * factor_x / 1000
+        fy = camdata[1].params[1] * factor_y / 1000
+        cx = camdata[1].params[2] * factor_x / 1000
+        cy = camdata[1].params[3] * factor_y / 1000
+    else:
+        raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
+    height = camdata[1].height
+    width = camdata[1].width
+    if camdata[1].model=="SIMPLE_PINHOLE":
+        focal_length_x = camdata[1].params[0]
+        FovY = focal2fov(focal_length_x, height)
+        FovX = focal2fov(focal_length_x, width)
+    elif camdata[1].model=="PINHOLE":
+        focal_length_x = camdata[1].params[0]
+        focal_length_y = camdata[1].params[1]
+        FovY = focal2fov(focal_length_y, height)
+        FovX = focal2fov(focal_length_x, width)
+    elif camdata[1].model=="OPENCV":
+        focal_length_x = camdata[1].params[0]
+        focal_length_y = camdata[1].params[1]
+        FovY = focal2fov(focal_length_y, height)
+        FovX = focal2fov(focal_length_x, width)
+        
+    fxfycxcy = np.array([fx,fy,cx,cy])
+   
+
+    fovx = np.degrees(2 * np.arctan(0.5 * input_size / fx))
+    fovy = np.degrees(2 * np.arctan(0.5 * input_size / fy))
+    print("[INFO] fov:",fovx, fovy)
+    import os
+    ret = {"sparse": [] }
+    c2ws = []
+    front_view_camera = None
+    ones_row = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32)
+    front_back_view_camera_truth = get_front_camera(azim_list = [0,180], focal=1.) # Pytorch3D
+    front_back_view_camera_truth = [torch.cat((c, ones_row), dim=0).double() for c in front_back_view_camera_truth]
+    front_view_camera_truth = front_back_view_camera_truth[0]
+    # front_view_camera_truth[[1,2]] = front_view_camera_truth[[2,1]]
+    back_view_camera_truth = front_back_view_camera_truth[1]
+    # front_view_camera_truth[0] *= -1
+    # front_view_camera_truth[2] *= -1
+    K = torch.zeros((3, 4))
+    # image_resolution_width = 1080  # 图像分辨率宽度，像素
+    # image_resolution_height = 1920  # 图像分辨率高度，像素
+    # sensor_width_mm = 36  # 传感器宽度，毫米
+    # fx = fy = 50 
+    # # 计算 PPU
+    # ppu = image_resolution_width / sensor_width_mm
+    # fx = fx * ppu
+    # fy = fy * ppu
+    # cx = image_resolution_width / 2
+    # cy = image_resolution_height / 2
+    K[0, 0], K[1, 1], K[0, 2], K[1, 2], K[2, 2]  = fx, fy, cx, cy, 1
+    K = torch.cat((K, ones_row), dim=0).unsqueeze(0).double()
+    t = get_front_camera(azim_list = [0,180], focal=1.) # Pytorch3D
+
+    # front_view_camera_truth[0:3,:] *= -1
+    print("front_view_camera_truth",t)
+    
+    
+    if front_view_camera is None:
+        extrinsic = imdata[int(front_view_filename.lstrip("0"))]
+        R = torch.tensor(extrinsic.qvec2rotmat()).double().unsqueeze(0)
+        T = torch.tensor(extrinsic.tvec.reshape(1, 3)).double()
+        front_view_w2c = torch.cat([R[0], T[0, :, None]], dim=1).double()
+        front_view_w2c = torch.cat((front_view_w2c, ones_row), dim=0).double()
+        print(front_view_w2c.shape)
+
+        front_view_w2c[:,1:3] *= -1. # COLMAP => Pytorch3D
+
+        # front_view_w2c[[1,2]] = front_view_w2c[[2,1]]
+
+        print("front_view", front_view_w2c)
+        # front_view tensor([[-0.9997, -0.0133,  0.0217,  0.2169],
+        # [-0.0211, -0.0382, -0.9990, -2.6005],
+        # [ 0.0141, -0.9992,  0.0379,  1.5357],
+        # [ 0.0000,  0.0000,  0.0000,  1.0000]])
+        # front_view_w2c = front_view_w2c.transpose(-2,-1)
+        front_view_camera: PerspectiveCameras = get_camera(world_to_cam=front_view_w2c,
+                                                            # focal_length=1.0, cam_type='orthogonal').to(device)
+                                                                 cam_type='fov').to(device)
+        ret["front"] = front_view_camera
+    # transform_matrix = torch.matmul(front_view_camera_truth, front_view_w2c.inverse())
+    # print(transform_matrix)
+    L = -5
+    move_transform = torch.eye(4, dtype=torch.float64)
+    move_transform[2, 3] = L
+    move_transform_center = torch.eye(4, dtype=torch.float64)
+    move_transform_center[2, 3] = L / 2
+    rotate_transform = torch.tensor([[ -1,  0,  0, 0],
+                                    [  0,  1,  0, 0],
+                                    [  0,  0, -1, 0],
+                                    [  0,  0,  0, 1]], dtype=torch.float64)
+    
+    center_point_w2c = move_transform_center @ front_view_w2c
+    print("center_point_w2c",center_point_w2c)
+    back_view_w2c = rotate_transform @ move_transform @ front_view_w2c
+    # back_view_w2c = back_view_w2c.transpose(-2,-1)
+    back_view_camera: PerspectiveCameras = get_camera(world_to_cam=back_view_w2c,
+                                                            # focal_length=1.0, cam_type='orthogonal').to(device)
+                                                                 cam_type='fov').to(device)
+    ret["back"] = back_view_camera
+    for filename in os.listdir(sparse_path):   
+        if filename.endswith(".jpg") or filename.endswith(".png"):
+            f, _ = os.path.splitext(filename)
+            # get input pose
+            extrinsic = imdata[int(f.lstrip("0"))]
+            R = torch.tensor(extrinsic.qvec2rotmat()).double().unsqueeze(0)
+            T = torch.tensor(extrinsic.tvec.reshape(1, 3)).double()
+            
+            w2c = torch.cat([R[0], T[0, :, None]], dim=1)
+            w2c = torch.cat((w2c, ones_row), dim=0)
+
+            w2c[:,1:3] *= -1. # COLMAP => Pytorch3D
+
+            # w2c[[1,2]] = w2c[[2,1]]
+            # w2c[0:3,:] *= -1. # COLMAP => Pytorch3D
+            print("other_view",w2c)
+
+            # w2c = torch.matmul(transform_matrix, w2c)
+            
+            # print("other_view_truth",w2c)
+
+            # w2c = front_view_camera_truth
+
+            # w2c[[1,2]] = w2c[[2,1]]
+
+            # w2c[0:3,:] *= -1
+
+            # w2c[:3,:3] = w2c[:3,:3].T
+
+            # w2c = w2c.transpose(-2,-1)
+
+            # w2c = w2c[:3, :]
+
+            # cameras: OrthographicCameras = get_camera(world_to_cam=w2c, focal_length=1.0, cam_type='ortho')
+            #                                         # cam_type='fov')
+            
+            cameras: PerspectiveCameras =  get_camera(world_to_cam=w2c, cam_type='fov').to(device)
+                                                    # cam_type='fov')
+            ret["sparse"].append(cameras)
+    
+    
+    return ret
+
+
+def compute_c2w_matrix(x, y, z, rot_x_deg, rot_y_deg, rot_z_deg):
+    # 将角度转换为弧度
+    rot_x_rad = math.radians(rot_x_deg)
+    rot_y_rad = math.radians(rot_y_deg)
+    rot_z_rad = math.radians(rot_z_deg)
+
+    # 计算绕x轴的旋转矩阵
+    Rx = torch.tensor([
+        [1, 0, 0, 0],
+        [0, math.cos(rot_x_rad), -math.sin(rot_x_rad), 0],
+        [0, math.sin(rot_x_rad), math.cos(rot_x_rad), 0],
+        [0, 0, 0, 1]
+    ], dtype=torch.float32)
+
+    # 计算绕y轴的旋转矩阵
+    Ry = torch.tensor([
+        [math.cos(rot_y_rad), 0, math.sin(rot_y_rad), 0],
+        [0, 1, 0, 0],
+        [-math.sin(rot_y_rad), 0, math.cos(rot_y_rad), 0],
+        [0, 0, 0, 1]
+    ], dtype=torch.float32)
+
+    # 计算绕z轴的旋转矩阵
+    Rz = torch.tensor([
+        [math.cos(rot_z_rad), -math.sin(rot_z_rad), 0, 0],
+        [math.sin(rot_z_rad), math.cos(rot_z_rad), 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ], dtype=torch.float32)
+
+    # 计算总的旋转矩阵
+    R = torch.matmul(torch.matmul(Rz, Ry), Rx)
+    R = R.t()
+    # rotate_z_inverse = torch.tensor([[1,  0,  0, 0],
+    #                              [0,  1,  0, 0],
+    #                              [0,  0, -1, 0],
+    #                              [0,  0,  0, 1]], dtype=torch.float32)
+    
+    # R = torch.matmul(rotate_z_inverse, R)
+
+    # 创建平移向量，并应用旋转
+    T = torch.tensor([x, y, z, 1], dtype=torch.float32)
+    # T = -torch.matmul(R, T)[:3]
+
+    # 将旋转矩阵和平移向量组合成仿射变换矩阵
+    # c2w = torch.eye(4, dtype=torch.float32)
+    c2w = R.clone()
+    c2w[:, 3] = T
+
+    return c2w
+
+
+def get_sparse_cameras_list_orth(front_view_path, sparse_path, raw_size, input_size, device):
+    import os 
+    import sys
+    front_view_filename = os.path.basename(front_view_path)
+    front_view_filename, _ = os.path.splitext(front_view_filename)
+    H = W = raw_size
+    img_wh = (input_size, input_size)
+    factor_x = factor_y = 1
+    input_size = 2048
+ 
+    ret = {"sparse": [] }
+    c2ws = []
+    front_view_camera = None
+    ones_row = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32)
+
+    front_view_w2c = compute_c2w_matrix(0.01, -0.05, 3.56, 0, 180, 0).double()
+    # front_view_w2c = torch.cat((front_view_w2c, ones_row), dim=0).double()
+    print(front_view_w2c.shape,front_view_w2c)
+
+    # front_view_w2c[:,1:3] *= -1. # COLMAP => Pytorch3D
+
+    # front_view_w2c[[1,2]] = front_view_w2c[[2,1]]
+
+    front_view_camera: OrthographicCameras = get_camera(world_to_cam=front_view_w2c,
+                                                        focal_length=1.0, cam_type='orthogonal').to(device)
+                                                                # cam_type='fov').to(device)
+    ret["front"] = front_view_camera
+    # transform_matrix = torch.matmul(front_view_camera_truth, front_view_w2c.inverse())
+    # print(transform_matrix)
+    L = -10
+    move_transform = torch.eye(4, dtype=torch.float64)
+    move_transform[2, 3] = L
+    move_transform_center = torch.eye(4, dtype=torch.float64)
+    move_transform_center[2, 3] = L / 2
+    rotate_transform = torch.tensor([[ -1,  0,  0, 0],
+                                    [  0,  1,  0, 0],
+                                    [  0,  0, -1, 0],
+                                    [  0,  0,  0, 1]], dtype=torch.float64)
+    
+    center_point_w2c = move_transform_center @ front_view_w2c
+    print("center_point_w2c",center_point_w2c)
+    back_view_w2c = rotate_transform @ move_transform @ front_view_w2c
+    # back_view_w2c = back_view_w2c.transpose(-2,-1)
+    back_view_camera: OrthographicCameras = get_camera(world_to_cam=back_view_w2c,
+                                                            focal_length=1.0, cam_type='orthogonal').to(device)
+                                                                #  cam_type='fov').to(device)
+    ret["back"] = back_view_camera
+
+
+
+
+    other_c2w_2 = compute_c2w_matrix(1.85, -0.05, 1.72, 0, 225, 0).double()
+    # other_c2w_2[:,1:3] *= -1. # COLMAP => Pytorch3D
+    # other_c2w_2[[1,2]] = other_c2w_2[[2,1]]
+    other_view_camera: OrthographicCameras = get_camera(world_to_cam=other_c2w_2,
+                                                focal_length=1.0, cam_type='orthogonal').to(device)
+    ret["sparse"].append(other_view_camera)
+
+
+    other_c2w_1 = compute_c2w_matrix(-2.096, -0.067, 2.034, 0, 135, 0).double()
+    # other_c2w_1[:,1:3] *= -1. # COLMAP => Pytorch3D
+    # other_c2w_1[[1,2]] = other_c2w_1[[2,1]]
+    other_view_camera: OrthographicCameras = get_camera(world_to_cam=other_c2w_1,
+                                                focal_length=1.0, cam_type='orthogonal').to(device)
+    ret["sparse"].append(other_view_camera)
+
+
+    ret["sparse"].append(front_view_camera)
+    return ret
+
+
+
+def get_front_camera(azim_list, focal=2/1.35, dist=1.1):
+    ret = []
+    for azim in azim_list:
+        R, T = look_at_view_transform(dist, 0, azim)
+        w2c = torch.cat([R[0].T, T[0, :, None]], dim=1).double()
+        ret.append(w2c)
+    return ret
 
 def get_cameras_list(azim_list, device, focal=2/1.35, dist=1.1):
     ret = []

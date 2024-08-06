@@ -1,5 +1,6 @@
 if __name__ == "__main__":
     import os
+    # os.environ['CUDA_VISIBLE_DEVICES'] = "7"
     import sys
     sys.path.append(os.curdir)
     import torch

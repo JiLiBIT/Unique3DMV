@@ -22,7 +22,7 @@ from app.gradio_3dgen import create_ui as create_3d_ui
 from app.all_models import model_zoo
 
 
-_TITLE = '''Unique3D: High-Quality and Efficient 3D Mesh Generation from a Single Image'''
+_TITLE = '''Unique3DMV: High-Quality and Efficient 3D Mesh Generation from Pose-free Multi View Images'''
 _DESCRIPTION = '''
 [Project page](https://wukailu.github.io/Unique3D/)
 

@@ -8,17 +8,73 @@ from app.custom_models.normal_prediction import predict_normals
 from scripts.refine_lr_to_sr import run_sr_fast
 from scripts.utils import save_glb_and_video
 from scripts.multiview_inference import geo_reconstruct
+from scripts.project_mesh import multiview_color_projection, get_cameras_list, get_sparse_cameras_list, get_sparse_cameras_list_orth
 
-def generate3dv2(preview_img, input_processing, seed, render_video=True, do_refine=True, expansion_weight=0.1, init_type="std"):
-    if preview_img is None:
+def generate3dv2(preview_path, input_processing, seed, render_video=True, do_refine=True, expansion_weight=0.1, init_type="ball"):
+    # preview_path = '../data/snow_boy/o_i/0069.jpg'
+    # sparse_path = '../data/snow_boy/images/'
+    preview_path = '../data/snow_boy_orth/2.png'
+    sparse_path = '../data/snow_boy_orth/'
+
+    if preview_path is None:
         raise gr.Error("preview_img is none")
-    if isinstance(preview_img, str):
-        preview_img = Image.open(preview_img)
+    if isinstance(preview_path, str):
+        preview_img = Image.open(preview_path)
+    sparse_pils = []
     
-    if preview_img.size[0] <= 512:
-        preview_img = run_sr_fast([preview_img])[0]
+    
+    from rembg import remove
+    from scripts.utils import session, simple_preprocess, expand2square
+    from app.utils import change_rgba_bg, rgba_to_rgb
+    for filename in os.listdir(sparse_path):
+        if filename.endswith(".jpg") or filename.endswith(".png"):
+            print("[INFO] filename:",filename)
+            if os.path.join(preview_path) == os.path.join(sparse_path, filename):
+                continue
+            img = Image.open(os.path.join(sparse_path, filename))
+            img = remove(img, session=session)
+            img = change_rgba_bg(img, "white")
+            img.convert('RGB').save("rgb_pils_0.jpg")
+            img = expand2square(img, (255, 255, 255, 0))
+            img.convert('RGB').save("rgb_pils_1.jpg")
+            if img is not None:
+                sparse_pils.append(img)
+    img = Image.open(preview_path)
+    img = remove(img, session=session)
+    img = change_rgba_bg(img, "white")
+    img = expand2square(img, (255, 255, 255, 0))
+    sparse_pils.append(img)
+
+    # if preview_img.size[0] <= 512:
+    #     preview_img = run_sr_fast([preview_img])[0] #TODO
+    # if sparse_pils[0].size[0] <= 512:
+    #     sparse_pils = run_sr_fast(sparse_pils) #TODO
+    
+    
     rgb_pils, front_pil = run_mvprediction(preview_img, remove_bg=input_processing, seed=int(seed)) # 6s
-    new_meshes = geo_reconstruct(rgb_pils, None, front_pil, do_refine=do_refine, predict_normal=True, expansion_weight=expansion_weight, init_type=init_type)
+    
+    sparse_cameras = get_sparse_cameras_list_orth(
+                                preview_path,
+                                sparse_path,
+                                raw_size = sparse_pils[0].size[0],
+                                input_size = rgb_pils[0].size[0],
+                                device="cuda")
+    
+    # sparse_cameras = get_sparse_cameras_list(
+    #                             preview_path,
+    #                             sparse_path,
+    #                             '../data/snow_boy/',
+    #                             raw_size = sparse_pils[0].size[0],
+    #                             input_size = rgb_pils[0].size[0],
+    #                             device="cuda")
+    sparse_pils = [img.resize((512,512)) for img in sparse_pils]
+    
+    # sparse_pils = run_sr_fast(sparse_pils)
+    sparse_pils = [change_rgba_bg(img, "white") for img in sparse_pils]
+    # rgb_pils[0].convert('RGB').save("rgb_pils_0.jpg")
+    sparse_pils[0].convert('RGB').save("sparse_pils_0.jpg")
+    sparse_pils[1].convert('RGB').save("sparse_pils_1.jpg")
+    new_meshes = geo_reconstruct(rgb_pils, None, sparse_pils, sparse_cameras, front_pil, do_refine=do_refine, predict_normal=True, expansion_weight=expansion_weight, init_type=init_type)
     vertices = new_meshes.verts_packed()
     vertices = vertices / 2 * 1.35
     vertices[..., [0, 2]] = - vertices[..., [0, 2]]
